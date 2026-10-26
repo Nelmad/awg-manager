@@ -65,7 +65,7 @@ type ConfigMutator interface {
 	// as "no live data" rather than as an error.
 	GetClashSelectorActive(selectorTag string) (string, error)
 	// DeclaredOutboundTags returns the outbound tags currently present in
-	// the committed subscriptions slot (after the last flush). The Service
+	// the working subscriptions slot (including staged changes). The Service
 	// reconciles stored MemberTags against this so servers that flush
 	// dropped (sing-box rejected) don't linger and get re-introduced as
 	// dangling group members on later rebuilds. Empty slice = "can't
@@ -2166,6 +2166,14 @@ func (s *Service) DeleteOrphans(ctx context.Context, id string) error {
 	// Stage + store + Reload — одна txMu-секция (общий батч адаптера).
 	if err := s.withTx(func() error {
 		orphans = slotOrphans(sub, s.mutator.DeclaredOutboundTags(), sub.MemberTags, sub.OrphanTags)
+		// Refresh may commit the slot before failing to persist MemberTags.
+		// Refuse before staging any deletion: the live group is newer than
+		// the store, and removing its members would cascade into its route.
+		if used := orphansUsedBySelector(sub, s.mutator.SubscriptionOutbounds(), orphans); len(used) > 0 {
+			err := fmt.Errorf("%w: очистка отменена: состав подписки расходится с конфигом — серверы %s используются группой %q", ErrValidation, strings.Join(used, ", "), sub.SelectorTag)
+			s.logWarn("subscription-orphans-delete", id, err.Error())
+			return err
+		}
 		for _, t := range orphans {
 			s.mutator.RemoveOutbound(t)
 		}
@@ -2183,4 +2191,33 @@ func (s *Service) DeleteOrphans(ctx context.Context, id string) error {
 	}
 	s.logInfo("subscription-orphans-delete", id, fmt.Sprintf("deleted %d orphan outbounds", len(orphans)))
 	return nil
+}
+
+// orphansUsedBySelector checks the group's reference fields that
+// cleanReferencesToTag would prune during a flush. Only the subscription's
+// own group is considered; this is not a general cross-slot reference check.
+func orphansUsedBySelector(sub *Subscription, outbounds []map[string]any, orphans []string) []string {
+	if len(orphans) == 0 {
+		return nil
+	}
+	refs := make(map[string]bool)
+	for _, ob := range outbounds {
+		if outboundTag(ob) != sub.SelectorTag {
+			continue
+		}
+		members, _ := ob["outbounds"].([]any)
+		for _, member := range members {
+			refs[stringOf(member)] = true
+		}
+		if def := stringOf(ob["default"]); def != "" {
+			refs[def] = true
+		}
+	}
+	var used []string
+	for _, tag := range orphans {
+		if refs[tag] {
+			used = append(used, tag)
+		}
+	}
+	return used
 }
